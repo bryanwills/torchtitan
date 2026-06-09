@@ -104,7 +104,6 @@ class GraphTrainerCompileConfig(CompileConfig):
     """Use AutoParallelGraph (ILP solver-based SPMD sharding) instead of
     manual TP/FSDP/EP. Forces the AOT compilation path internally."""
 
-
 def validate_autoparallel_config(
     compile_config: GraphTrainerCompileConfig,
 ) -> None:
@@ -143,6 +142,7 @@ def to_graph_trainer_config(
     d["model_spec"] = replace(
         base_config.model_spec,
         parallelize_fn=graph_spec.parallelize_fn,
+        pipelining_fn=graph_spec.pipelining_fn,
         model=graph_model,
     )
     d.pop("compile")

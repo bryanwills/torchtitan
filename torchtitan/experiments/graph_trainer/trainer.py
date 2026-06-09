@@ -102,11 +102,6 @@ class GraphTrainer(Trainer):
 
         _maybe_apply_numa_binding(self.device.index, self.device.type)
 
-        if self.config.compile.mode == "aot_fx_trace" and self.parallel_dims.pp_enabled:
-            raise ValueError(
-                "aot_fx_trace compile mode does not support Pipeline Parallel"
-            )
-
         # Lazy state for aot_fx_trace mode
         self._traced_step: TracedResult | None = None
 
@@ -120,7 +115,7 @@ class GraphTrainer(Trainer):
         labels: torch.Tensor,
         global_valid_tokens: torch.Tensor,
     ) -> torch.Tensor:
-        if self.config.compile.mode != "aot_fx_trace":
+        if self.config.compile.mode != "aot_fx_trace" or self.parallel_dims.pp_enabled:
             return super().forward_backward_step(
                 input_dict=input_dict,
                 labels=labels,
