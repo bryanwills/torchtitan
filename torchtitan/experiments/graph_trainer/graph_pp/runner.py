@@ -7,7 +7,7 @@
 import dataclasses
 import re
 from collections.abc import Callable
-from typing import Any, cast
+from typing import Any, Protocol, cast
 
 import torch
 import torch.fx as fx
@@ -23,6 +23,7 @@ from torch.distributed.pipelining.schedules import (
     BACKWARD_WEIGHT,
     FORWARD,
     FULL_BACKWARD,
+    OVERLAP_F_B,
     REDUCE_GRAD,
     RESHARD,
     UNSHARD,
@@ -43,6 +44,9 @@ from torchtitan.experiments.graph_trainer.graph_pp.boxed import execute_graph_bo
 from torchtitan.experiments.graph_trainer.graph_pp.fsdp import (
     split_backward_fsdp_collectives,
     split_forward_fsdp_collectives,
+)
+from torchtitan.experiments.graph_trainer.graph_pp.graph_multiplex import (
+    multiplex_fw_bw_graph,
 )
 from torchtitan.experiments.graph_trainer.graph_pp.partition import (
     GraphPPGraphMeta,
@@ -89,6 +93,16 @@ class GraphMeta:
 class StageTraceSpec:
     output_spec: pytree.TreeSpec | None = None
     output_grad_spec: pytree.TreeSpec | None = None
+
+
+class MultiplexFwBwGraphPass(Protocol):
+    def __call__(
+        self,
+        fw_graph: fx.GraphModule,
+        bw_graph: fx.GraphModule,
+    ) -> fx.GraphModule:
+        ...
+
 
 def _execute_graph(graph: fx.GraphModule | Callable[[list[Any]], Any], args: list[Any]):
     return execute_graph_boxed(graph, args)
@@ -933,6 +947,109 @@ def stage_reduce_grad(action: _Action, ctx: _PipelineContext) -> None:
         )
 
 
+def get_multiplexed_graph_callables(
+    stage_graphs: dict[int, GraphCallables],
+    multiplex_fw_bw_graph_pass: MultiplexFwBwGraphPass,
+) -> dict[tuple[int, int], fx.GraphModule]:
+    multiplexed = {}
+    for bw_stage_idx, bw_graphs in stage_graphs.items():
+        for fw_stage_idx, fw_graphs in stage_graphs.items():
+            if bw_stage_idx == fw_stage_idx:
+                continue
+            multiplexed[(fw_stage_idx, bw_stage_idx)] = multiplex_fw_bw_graph_pass(
+                fw_graphs.fw,
+                bw_graphs.full_bw,
+            )
+    return multiplexed
+
+
+def overlap_fw_bw(
+    action: _Action,
+    ctx: _PipelineContext,
+) -> None:
+    if action.sub_actions is None:
+        raise ValueError("OVERLAP_F_B action requires sub_actions")
+    fw_action = action.sub_actions[0]
+    bw_action = action.sub_actions[1]
+
+    (
+        schedule,
+        stage_index_to_stage,
+        fw_stage,
+        fw_mb_index,
+        fw_is_next_stage_on_this_rank,
+    ) = _prepare_fwd_common(fw_action, ctx)
+    (
+        _,
+        _,
+        bw_stage,
+        bw_mb_index,
+        bw_is_prev_stage_on_this_rank,
+    ) = _prepare_backward_common(bw_action, ctx)
+    if not bw_stage.has_backward:
+        return
+
+    args, kwargs, target = _prepare_fwd_user_args(fw_stage, fw_mb_index, ctx)
+    loss_kwargs = getattr(schedule, "_graph_pp_loss_kwargs", {})
+    fw_stage.ensure_graphs(args, kwargs, target, loss_kwargs)
+    assert fw_stage.graph_callables is not None and fw_stage.graph_meta is not None
+    assert bw_stage.graph_callables is not None and bw_stage.graph_meta is not None
+
+    multiplexed_graphs = getattr(schedule, "_graph_pp_multiplexed_graphs", None)
+    if multiplexed_graphs is None:
+        multiplexed_graphs = {}
+        setattr(schedule, "_graph_pp_multiplexed_graphs", multiplexed_graphs)
+    pair = (fw_action.stage_index, bw_action.stage_index)
+    if pair not in multiplexed_graphs:
+        multiplexed_graphs[pair] = multiplex_fw_bw_graph(
+            fw_stage.graph_callables.fw,
+            bw_stage.graph_callables.full_bw,
+        )
+
+    bw_args = _prepare_backward_args(bw_stage, bw_mb_index)
+    fw_args = _prepare_fwd_graph_args(fw_stage, args, kwargs, target, loss_kwargs)
+    multiplexed_outputs = _execute_graph(
+        multiplexed_graphs[pair],
+        [*bw_args, *fw_args],
+    )
+
+    num_param_grads = bw_stage.graph_meta.num_params
+    num_bw_outputs = num_param_grads + bw_stage.graph_meta.num_input_grads
+    bw_outputs = multiplexed_outputs[:num_bw_outputs]
+    param_buffer_grads = list(bw_outputs[:num_param_grads])
+    input_grads = list(bw_outputs[num_param_grads:])
+    fw_outputs = multiplexed_outputs[num_bw_outputs:]
+    output = (
+        fw_outputs[0]
+        if fw_stage.graph_meta.num_user_outputs == 1
+        else tuple(fw_outputs[: fw_stage.graph_meta.num_user_outputs])
+    )
+    saved_intermediates = tuple(fw_outputs[fw_stage.graph_meta.num_user_outputs :])
+
+    bw_stage._accumulate_stage_unsharded_grads(param_buffer_grads)
+    _post_fwd_common(
+        fw_stage,
+        fw_mb_index,
+        output,
+        saved_intermediates,
+        schedule,
+        stage_index_to_stage,
+        ctx,
+        fw_is_next_stage_on_this_rank,
+    )
+    _post_backward_common(
+        bw_stage,
+        bw_mb_index,
+        input_grads,
+        stage_index_to_stage,
+        bw_is_prev_stage_on_this_rank,
+    )
+    last_backward = (
+        schedule.backward_counter[bw_stage.stage_index] == schedule._n_microbatches
+    )
+    _maybe_finish_last_backward(bw_stage, schedule, last_backward=last_backward)
+
+
 class GraphPPRunner:
     def __init__(self, schedule: _PipelineScheduleRuntime) -> None:
         self.schedule = schedule
@@ -1027,4 +1144,5 @@ def register_graph_pp_schedule(schedule: _PipelineScheduleRuntime) -> GraphPPRun
     schedule.register_custom_function(REDUCE_GRAD, stage_reduce_grad)
     schedule.register_custom_function(BACKWARD_INPUT, stage_backward_input)
     schedule.register_custom_function(BACKWARD_WEIGHT, stage_backward_weight)
+    schedule.register_custom_function(OVERLAP_F_B, overlap_fw_bw)
     return GraphPPRunner(schedule)

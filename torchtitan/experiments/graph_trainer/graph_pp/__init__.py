@@ -11,6 +11,9 @@ from torchtitan.experiments.graph_trainer.graph_pp.fsdp import (
     split_backward_fsdp_collectives,
     split_forward_fsdp_collectives,
 )
+from torchtitan.experiments.graph_trainer.graph_pp.graph_multiplex import (
+    multiplex_fw_bw_graph,
+)
 from torchtitan.experiments.graph_trainer.graph_pp.partition import (
     GraphPPGraphMeta,
     GraphPPPartitionedGraphs,
@@ -30,6 +33,7 @@ __all__ = [
     "GraphPPPartitionedGraphs",
     "GraphPPSlotDescriptor",
     "execute_graph_boxed",
+    "multiplex_fw_bw_graph",
     "partition_joint_graph",
     "split_backward_fsdp_collectives",
     "split_di_dw_graph",

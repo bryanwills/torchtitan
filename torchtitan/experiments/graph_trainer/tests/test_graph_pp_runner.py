@@ -23,6 +23,8 @@ from torchtitan.experiments.graph_trainer.configs import GraphTrainerCompileConf
 from torchtitan.experiments.graph_trainer.graph_pp.pipeline import (
     _validate_graph_pp_config,
 )
+from torchtitan.experiments.graph_trainer.graph_pp import multiplex_fw_bw_graph
+from torchtitan.experiments.graph_trainer.graph_pp.boxed import execute_graph_boxed
 
 
 class GraphPPRunnerTraceTest(unittest.TestCase):
@@ -102,6 +104,47 @@ class GraphPPRunnerTraceTest(unittest.TestCase):
         )
         dW_grads = _run_dW_bw_module(stage.graph_callables.bw_dW, dW_inputs)
         for actual, expected in zip(dW_grads + dI_grads, expected_grads, strict=True):
+            self.assertTrue(torch.allclose(actual, expected))
+
+    def test_multiplexed_graph_returns_backward_then_forward_outputs(self) -> None:
+        torch.manual_seed(0)
+        model = nn.Linear(4, 3)
+        stage = types.SimpleNamespace(
+            submod=model,
+            is_last=False,
+            loss_fn=None,
+            stage_index=0,
+        )
+        x = torch.randn(2, 4, requires_grad=True)
+        output_grad = torch.randn(2, 3)
+        _trace_stage_graphs(stage, (x,), {}, None, {})
+
+        state = [*model.parameters()]
+        fw_outputs = execute_graph_boxed(
+            stage.graph_callables.fw,
+            [*state, x],
+        )
+        bw_outputs = execute_graph_boxed(
+            stage.graph_callables.full_bw,
+            [*fw_outputs[1:], output_grad],
+        )
+        multiplexed = multiplex_fw_bw_graph(
+            stage.graph_callables.fw,
+            stage.graph_callables.full_bw,
+        )
+
+        multiplexed_outputs = execute_graph_boxed(
+            multiplexed,
+            [*fw_outputs[1:], output_grad, *state, x],
+        )
+
+        expected_outputs = [*bw_outputs, *fw_outputs]
+        self.assertEqual(len(multiplexed_outputs), len(expected_outputs))
+        for actual, expected in zip(
+            multiplexed_outputs,
+            expected_outputs,
+            strict=True,
+        ):
             self.assertTrue(torch.allclose(actual, expected))
 
     def test_last_stage_graphs_return_loss_and_input_grad(self) -> None:
