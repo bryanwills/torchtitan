@@ -28,6 +28,17 @@ from torchtitan.experiments.graph_trainer.graph_pp.boxed import execute_graph_bo
 
 
 class GraphPPRunnerTraceTest(unittest.TestCase):
+    def test_explicit_fused_edge_fsdp_flag_is_accepted(self) -> None:
+        compile_config = GraphTrainerCompileConfig(
+            graph_pp_enable_fused_edge_fsdp_graphs=True
+        )
+        _validate_graph_pp_config(
+            compile_config=compile_config,
+            parallelism=ParallelismConfig(
+                pipeline_parallel_schedule="Interleaved1F1B"
+            ),
+        )
+
     def test_graph_pp_accumulates_grads_only_for_trainable_params(self) -> None:
         model = nn.Sequential(nn.Linear(4, 4), nn.Linear(4, 2))
         for param in model[0].parameters():
@@ -43,6 +54,8 @@ class GraphPPRunnerTraceTest(unittest.TestCase):
                 "unsharded_grads": [],
                 "trainable_params": [],
             },
+            _graph_pp_fused_first_forward_done=True,
+            _graph_pp_fused_reduce_done=True,
         )
         runner = GraphPPRunner.__new__(GraphPPRunner)
         runner._populate_stage_states(stage)

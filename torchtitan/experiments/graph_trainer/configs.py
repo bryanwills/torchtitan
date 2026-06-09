@@ -104,6 +104,12 @@ class GraphTrainerCompileConfig(CompileConfig):
     """Use AutoParallelGraph (ILP solver-based SPMD sharding) instead of
     manual TP/FSDP/EP. Forces the AOT compilation path internally."""
 
+    graph_pp_enable_fused_edge_fsdp_graphs: bool = False
+    """Fuse edge-stage FSDP unshard/reduce-grad work into the edge forward
+    and backward graphs. Disabled by default; GraphPP builds the separate
+    unshard and reduce-grad graph infrastructure regardless of this flag."""
+
+
 def validate_autoparallel_config(
     compile_config: GraphTrainerCompileConfig,
 ) -> None:

@@ -735,6 +735,19 @@ def _post_fwd_common(
         )
 
 
+def _should_use_fused_edge_forward(stage: GraphPipelineStage, mb_index: int) -> bool:
+    if not stage.compile_config.graph_pp_enable_fused_edge_fsdp_graphs:
+        return False
+    assert stage.graph_callables is not None
+    return (
+        mb_index == 0
+        and not stage._graph_pp_fused_first_forward_done
+        and not stage.state["unsharded_params"]
+        and stage.graph_callables.fw_fsdp is not None
+        and stage.graph_callables.unshard is not None
+    )
+
+
 def stage_forward(action: _Action, ctx: _PipelineContext) -> None:
     (
         schedule,
@@ -747,11 +760,21 @@ def stage_forward(action: _Action, ctx: _PipelineContext) -> None:
     loss_kwargs = getattr(schedule, "_graph_pp_loss_kwargs", {})
     stage.ensure_graphs(args, kwargs, target, loss_kwargs)
     assert stage.graph_callables is not None and stage.graph_meta is not None
-    output, saved_intermediates = _run_fw_module(
-        stage.graph_callables.fw,
-        stage.graph_meta,
-        _prepare_fwd_graph_args(stage, args, kwargs, target, loss_kwargs),
-    )
+    if _should_use_fused_edge_forward(stage, mb_index):
+        assert stage.graph_callables.fw_fsdp is not None
+        output, saved_intermediates, unsharded_params = _run_fw_fsdp_module(
+            stage.graph_callables.fw_fsdp,
+            stage.graph_meta,
+            _prepare_fwd_fsdp_graph_args(stage, args, kwargs, target, loss_kwargs),
+        )
+        stage.state["unsharded_params"] = list(unsharded_params)
+        stage._graph_pp_fused_first_forward_done = True
+    else:
+        output, saved_intermediates = _run_fw_module(
+            stage.graph_callables.fw,
+            stage.graph_meta,
+            _prepare_fwd_graph_args(stage, args, kwargs, target, loss_kwargs),
+        )
     _post_fwd_common(
         stage,
         mb_index,
@@ -838,6 +861,19 @@ def _maybe_finish_last_backward(
     if not last_backward:
         return
     stage.scale_grads(schedule._n_microbatches if schedule.scale_grads else 1)
+    if not stage.compile_config.graph_pp_enable_fused_edge_fsdp_graphs:
+        return
+    assert stage.graph_callables is not None
+    if stage.graph_callables.reduce_grad is None:
+        stage.state["sharded_grads"] = list(stage.state["unsharded_grads"])
+    else:
+        stage.state["sharded_grads"] = list(
+            _execute_graph(
+                stage.graph_callables.reduce_grad,
+                list(stage.state["unsharded_grads"]),
+            )
+        )
+    stage._graph_pp_fused_reduce_done = True
 
 
 def stage_full_backward(action: _Action, ctx: _PipelineContext) -> None:
@@ -925,6 +961,14 @@ def stage_backward_weight(action: _Action, ctx: _PipelineContext) -> None:
 def stage_unshard(action: _Action, ctx: _PipelineContext) -> None:
     _, _, stage = _get_stage_from_action(action, ctx)
     if stage.graph_callables is not None:
+        if (
+            stage.compile_config.graph_pp_enable_fused_edge_fsdp_graphs
+            and not stage._graph_pp_fused_first_forward_done
+            and not stage.state["unsharded_params"]
+            and stage.graph_callables.fw_fsdp is not None
+            and stage.graph_callables.unshard is not None
+        ):
+            return
         stage._ensure_unsharded_params()
 
 
@@ -936,6 +980,8 @@ def stage_reshard(action: _Action, ctx: _PipelineContext) -> None:
 def stage_reduce_grad(action: _Action, ctx: _PipelineContext) -> None:
     _, _, stage = _get_stage_from_action(action, ctx)
     assert stage.graph_callables is not None
+    if stage._graph_pp_fused_reduce_done:
+        return
     if stage.graph_callables.reduce_grad is None:
         stage.state["sharded_grads"] = list(stage.state["unsharded_grads"])
     else:
