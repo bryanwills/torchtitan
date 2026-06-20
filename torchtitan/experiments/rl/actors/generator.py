@@ -13,6 +13,7 @@ import logging
 import math
 import os
 from dataclasses import dataclass, field
+from typing import Literal
 
 import torch
 import torch.distributed as dist
@@ -20,19 +21,15 @@ import torchstore as ts
 from monarch.actor import Actor, current_rank, endpoint
 from monarch.rdma import is_rdma_available
 from torchtitan.components.checkpoint import CheckpointManager
-from torchtitan.config import (
-    CompileConfig,
-    Configurable,
-    DebugConfig,
-    ParallelismConfig,
-)
+from torchtitan.config import CompileConfig, Configurable, DebugConfig
 from torchtitan.distributed.utils import set_batch_invariance
 from torchtitan.experiments.rl.batch_invariance import (
     force_logprobs_fn_for_batch_invariance,
     patch_bmm_for_batch_invariance,
 )
 from torchtitan.experiments.rl.models.vllm_registry import (
-    registry_to_vllm,
+    InferenceParallelismConfig,
+    register_to_vllm,
     TORCHTITAN_CONFIG_FORMAT,
 )
 from torchtitan.experiments.rl.observability import metrics as m
@@ -44,6 +41,7 @@ from torchtitan.tools.logging import init_logger
 from torchtitan.tools.utils import has_cuda_capability
 from vllm import EngineArgs, LLMEngine, SamplingParams
 from vllm.config import AttentionConfig, CompilationConfig
+from vllm.config.compilation import CompilationMode
 from vllm.outputs import RequestOutput
 from vllm.sampling_params import RequestOutputKind
 from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -108,6 +106,15 @@ def _prepare_generation_request_metrics(
     ]
 
 
+# vLLM's chunked-prefill chunk size (max_num_batched_tokens). "FULL" also graphs
+# prefill, whose per-step token count is bounded by this, so its capture sizes
+# must reach it (else prefill falls back to eager). The generator does not
+# override max_num_batched_tokens, so this is vLLM's default.
+# TODO: this value still needs discussion -- ideally read the engine's actual
+# max_num_batched_tokens rather than hardcoding the default.
+_VLLM_DEFAULT_MAX_NUM_BATCHED_TOKENS = 2048
+
+
 @dataclass(kw_only=True, slots=True)
 class VLLMCudagraphConfig:
     """CUDA graph capture settings for the vLLM inference engine.
@@ -116,14 +123,29 @@ class VLLMCudagraphConfig:
     ``RLTrainer`` level, shared by both trainer and generator.  Only CUDA
     graph capture, which is vLLM-specific, is controlled here.
 
-    When enabled, vLLM captures the forward pass as a single CUDA graph
-    ("full" mode).  "piecewise" modes are intentionally excluded: they
-    require vLLM's whole-model torch.compile to split the graph around
-    non-capturable ops, which conflicts with per-layer compile.
+    ``mode`` selects which vLLM cudagraph mode to capture; see that field and
+    ``get_vllm_compilation_config`` for the per-mode trade-offs. The default,
+    ``FULL_DECODE_ONLY``, is the only mode that is both cheap (no inductor
+    compile) and correct with our varlen/FA3 attention backend.
     """
 
     enable: bool = True
-    """Whether to enable CUDA graph capture (vLLM "full" mode)."""
+    """Whether to enable CUDA graph capture."""
+
+    mode: Literal["FULL_DECODE_ONLY", "FULL"] = "FULL_DECODE_ONLY"
+    """Which vLLM cudagraph mode to capture (when ``enable``):
+
+    - ``"FULL_DECODE_ONLY"`` (default): graph pure-decode batches; prefill / mixed
+      batches run eager. Cheap (no inductor compile) and the only mode that is
+      correct with our varlen/FA3 attention backend (#3668).
+    - ``"FULL"``: graph the whole forward, prefill included. Corrupts generation
+      with our varlen backend (#3668); kept for experiments / repro only.
+
+    FULL_AND_PIECEWISE (graph prefill piecewise around attention) is not offered:
+    the only correct path is vLLM's slow whole-model inductor compile, and the
+    cheap path (breakable cudagraph) corrupts because our varlen attention op
+    lacks an eager break-point. See #3709.
+    """
 
     # TODO: Validate CUDA graph capture with MoE / Expert Parallelism.
     # MoE routing produces dynamic shapes that may conflict with full
@@ -137,24 +159,33 @@ class VLLMCudagraphConfig:
     def get_vllm_compilation_config(
         self, *, max_num_seqs: int
     ) -> CompilationConfig | None:
-        """Build a vLLM ``CompilationConfig``, or return ``None`` when
-        CUDA graphs are disabled.
+        """Build a vLLM ``CompilationConfig`` for ``mode``, or return ``None``
+        when CUDA graphs are disabled.
 
-        Capture sizes are powers of 2 from 1 up to ``max_num_seqs``, plus
-        ``max_num_seqs`` itself if it isn't a power of 2.
+        Capture sizes are powers of 2 up to the cap, plus ``max_num_seqs`` itself
+        so the decode batch is captured exactly. The cap is ``max_num_seqs`` for
+        ``FULL_DECODE_ONLY`` (decode batch == num_seqs); ``FULL`` also graphs
+        prefill, so it extends to the prefill chunk size.
+
+        ``mode=CompilationMode.NONE`` captures cudagraphs without vLLM's
+        whole-model inductor compile, which we never use (#3709).
         """
         if not self.enable:
             return None
         if max_num_seqs <= 0:
             raise ValueError(f"max_num_seqs must be positive, got {max_num_seqs}")
         cap = max_num_seqs
+        if self.mode == "FULL":
+            cap = max(cap, _VLLM_DEFAULT_MAX_NUM_BATCHED_TOKENS)
         sizes = [1 << i for i in range(int(math.log2(cap)) + 1)]
-        if cap not in sizes:
-            sizes.append(cap)
+        if max_num_seqs not in sizes:
+            sizes.append(max_num_seqs)
+        sizes = sorted(sizes)
+
         return CompilationConfig(
-            cudagraph_mode="full",
-            mode=0,
-            cudagraph_capture_sizes=sorted(sizes),
+            cudagraph_mode=self.mode,
+            mode=CompilationMode.NONE,
+            cudagraph_capture_sizes=sizes,
         )
 
 
@@ -228,7 +259,9 @@ class VLLMGenerator(Actor, Configurable):
         """Generator actor configuration.
         TODO: Expose a EngineConfig field to passing config to vLLM Engine"""
 
-        parallelism: ParallelismConfig = field(default_factory=ParallelismConfig)
+        parallelism: InferenceParallelismConfig = field(
+            default_factory=InferenceParallelismConfig
+        )
         """Parallelism configuration for the vLLM engine."""
 
         sampling: SamplingConfig = field(default_factory=SamplingConfig)
@@ -269,35 +302,16 @@ class VLLMGenerator(Actor, Configurable):
         the new weights. No effect under strict-drain (engine idle at pull time); async hot-swap only."""
 
         def __post_init__(self):
-            # VLLMGenerator supports TP plus MoE EP. vLLM handles its own
-            # process groups, and the wrapper applies the model parallelisms.
+            # The generator runs vLLM full expert parallelism: vLLM forms the EP
+            # group from all DP*TP ranks, so expert_parallel_degree must equal
+            # data_parallel_degree * tensor_parallel_degree (or 1 to disable EP).
             p = self.parallelism
-            if p.data_parallel_replicate_degree != 1:
+            full_ep = p.data_parallel_degree * p.tensor_parallel_degree
+            if p.expert_parallel_degree not in (1, full_ep):
                 raise ValueError(
-                    f"Generator does not support data parallel replication, "
-                    f"got dp_replicate={p.data_parallel_replicate_degree}"
-                )
-            if p.pipeline_parallel_degree > 1:
-                raise ValueError(
-                    f"Generator does not support pipeline parallelism, "
-                    f"got pp={p.pipeline_parallel_degree}"
-                )
-            if p.context_parallel_degree > 1:
-                raise ValueError(
-                    f"Generator does not support context parallelism, "
-                    f"got cp={p.context_parallel_degree}"
-                )
-            if p.enable_sequence_parallel:
-                raise ValueError(
-                    "Generator does not support sequence parallelism: "
-                    "spmd_types erasure mode requires sequence length to be "
-                    "evenly divisible by TP, which doesn't hold for inference "
-                    "(uneven batches). Set enable_sequence_parallel=False."
-                )
-            if not p.disable_loss_parallel:
-                raise ValueError(
-                    "Generator requires disable_loss_parallel=True, "
-                    f"got disable_loss_parallel={p.disable_loss_parallel}"
+                    f"expert_parallel_degree ({p.expert_parallel_degree}) must be 1 "
+                    f"(no expert parallelism) or equal data_parallel_degree * "
+                    f"tensor_parallel_degree ({full_ep}) in the generator."
                 )
 
             if (
@@ -347,7 +361,7 @@ class VLLMGenerator(Actor, Configurable):
         self._max_num_seqs = max_num_seqs
 
         # Register TorchTitan model + parser with vLLM
-        registry_to_vllm(
+        register_to_vllm(
             model_spec,
             parallelism=config.parallelism,
             compile_config=compile_config,
@@ -387,11 +401,12 @@ class VLLMGenerator(Actor, Configurable):
             model=model_path,
             trust_remote_code=True,
             # Use the torchtitan custom config parser (registered by
-            # registry_to_vllm above). It builds PretrainedConfig from
+            # register_to_vllm above). It builds PretrainedConfig from
             # ModelSpec instead of reading config.json from disk.
             config_format=TORCHTITAN_CONFIG_FORMAT,
             dtype=config.model_dtype,
             tensor_parallel_size=config.parallelism.tensor_parallel_degree,
+            data_parallel_size=config.parallelism.data_parallel_degree,
             # NOTE: Monarch launches the generator workers and sets the torch
             # elastic distributed env; with external_launcher, vLLM uses that
             # world to build its process groups. vLLM does not take an
@@ -664,7 +679,8 @@ class VLLMGenerator(Actor, Configurable):
                 lambda: self._close_request is not None
                 or self._model_state_dict_pull_request is not None
                 or self._queued_generation_requests
-                or self._engine.has_unfinished_requests()
+                # rank-0-only decision: use the local (no DP all-reduce) check;
+                or self._engine.output_processor.has_unfinished_requests()
             )
 
             if self._close_request is not None:
