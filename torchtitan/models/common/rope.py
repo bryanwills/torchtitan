@@ -36,6 +36,20 @@ def _maybe_check_max_pos(positions: torch.Tensor, *, max_valid_pos: int) -> None
     )
 
 
+def _check_shape_equal(actual, expected, context: str) -> None:
+    def make_message(i, actual_dim, expected_dim):
+        def message() -> str:
+            return f"{context} dim {i}: expected {expected_dim}, got {actual_dim}"
+
+        return message
+
+    for i, (actual_dim, expected_dim) in enumerate(zip(actual, expected, strict=True)):
+        torch._check(
+            actual_dim == expected_dim,
+            make_message(i, actual_dim, expected_dim),
+        )
+
+
 class RoPE(Module):
     """Shared Rotary Position Embedding module.
 
@@ -362,21 +376,48 @@ def _reshape_for_broadcast(
     cache_width = rope_cache.shape[-1]
     if positions is None:
         rope_cache = rope_cache[0:seqlen]
-        assert rope_cache.shape == (seqlen, cache_width)
+        _check_shape_equal(rope_cache.shape, (seqlen, cache_width), "rope_cache")
         shape = [
             d if i == 1 else cache_width if i == ndim - 1 else 1
             for i, d in enumerate(query_shape)
         ]
         return rope_cache.view(*shape)
-    else:
-        assert positions.shape == (bsz, seqlen)
-        rope_cache_expanded = rope_cache[None, :, None, :].expand(bsz, -1, -1, -1)
-        rope_cache = torch.gather(
-            rope_cache_expanded,
-            dim=1,
-            index=positions.view(bsz, seqlen, 1, 1).expand(bsz, seqlen, 1, cache_width),
-        )
-        return rope_cache
+
+    from torch.fx.experimental.symbolic_shapes import guard_or_false
+
+    # Keep the concrete/provable singleton fast path. If singleton-ness is not
+    # provable for an unbacked SymInt, fall through to the symbolic-safe path
+    # below, which accepts either singleton or per-batch positions.
+    if guard_or_false(positions.size(0) == 1):
+        _check_shape_equal(positions.shape, (1, seqlen), "positions")
+        rope_cache = rope_cache[positions.squeeze(0)]
+        _check_shape_equal(rope_cache.shape, (seqlen, cache_width), "rope_cache")
+        shape = [
+            d if i == 1 else cache_width if i == ndim - 1 else 1
+            for i, d in enumerate(query_shape)
+        ]
+        return rope_cache.view(*shape)
+
+    positions_bsz = positions.shape[0]
+    _check_shape_equal(positions.shape, (positions_bsz, seqlen), "positions")
+    # The gather path accepts either per-batch positions or singleton positions
+    # whose singleton-ness was not statically provable above.
+    torch._check(
+        (positions_bsz == 1) | (positions_bsz == bsz),
+        lambda: (
+            "positions dim 0 must be 1 or match query batch: "
+            f"expected 1 or {bsz}, got {positions_bsz}"
+        ),
+    )
+    positions = positions.expand(bsz, seqlen)
+    rope_cache_expanded = rope_cache[None, :, None, :].expand(bsz, -1, -1, -1)
+    rope_cache = torch.gather(
+        rope_cache_expanded,
+        dim=1,
+        index=positions.view(bsz, seqlen, 1, 1).expand(bsz, seqlen, 1, cache_width),
+    )
+    _check_shape_equal(rope_cache.shape, (bsz, seqlen, 1, cache_width), "rope_cache")
+    return rope_cache
 
 
 def _maybe_wrap_positions(

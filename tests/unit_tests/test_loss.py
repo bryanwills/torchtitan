@@ -432,6 +432,77 @@ class TestChunkedCELoss(unittest.TestCase):
         chunked_loss.lm_head = model.output
         return model, chunked_loss
 
+    def _torch_chunk_loss_reference(
+        self,
+        lm_head: nn.Module,
+        hidden_states: torch.Tensor,
+        labels: torch.Tensor,
+        num_chunks: int,
+        global_valid_tokens: float | None = None,
+    ):
+        total_loss = hidden_states.new_zeros((), dtype=torch.float32)
+        for h_chunk, label_chunk in zip(
+            torch.chunk(hidden_states, num_chunks, dim=1),
+            torch.chunk(labels, num_chunks, dim=1),
+        ):
+            chunk_loss = cross_entropy_loss(
+                lm_head(h_chunk.contiguous()),
+                label_chunk.contiguous(),
+            )
+            if global_valid_tokens is not None:
+                chunk_loss = chunk_loss / global_valid_tokens
+            total_loss = total_loss + chunk_loss.detach()
+        return total_loss
+
+    def test_equal_split_chunks_match_torch_chunk_for_supported_shapes(self):
+        torch.manual_seed(42)
+        tensors = {
+            "hidden": torch.randn(2, 5, 12).transpose(1, 2),
+            "labels": torch.arange(24).reshape(2, 12),
+        }
+        num_chunks = 3
+
+        for name, tensor in tensors.items():
+            with self.subTest(name=name):
+                split_chunks = ChunkedCELoss._split_equal_chunks(tensor, num_chunks)
+                chunk_chunks = tuple(
+                    c.contiguous() for c in torch.chunk(tensor, num_chunks, dim=1)
+                )
+
+                self.assertEqual(len(split_chunks), len(chunk_chunks))
+                for split_chunk, chunk_chunk in zip(split_chunks, chunk_chunks):
+                    self.assertEqual(split_chunk.shape, chunk_chunk.shape)
+                    self.assertTrue(split_chunk.is_contiguous())
+                    self.assertTrue(torch.equal(split_chunk, chunk_chunk))
+
+    def test_equal_split_chunks_backward_matches_torch_chunk(self):
+        torch.manual_seed(42)
+        B, L, D, num_chunks = 2, 12, 5, 3
+        weights = torch.randn(D)
+        hidden = torch.randn(B, L, D)
+
+        def weighted_chunk_loss(chunks):
+            total = chunks[0].new_zeros(())
+            for i, chunk in enumerate(chunks):
+                total = total + ((i + 1) * chunk * weights).square().sum()
+            return total
+
+        split_hidden = hidden.detach().clone().requires_grad_(True)
+        chunk_hidden = hidden.detach().clone().requires_grad_(True)
+
+        split_loss = weighted_chunk_loss(
+            ChunkedCELoss._split_equal_chunks(split_hidden, num_chunks)
+        )
+        chunk_loss = weighted_chunk_loss(
+            tuple(c.contiguous() for c in torch.chunk(chunk_hidden, num_chunks, dim=1))
+        )
+
+        split_loss.backward()
+        chunk_loss.backward()
+
+        torch.testing.assert_close(split_loss, chunk_loss)
+        torch.testing.assert_close(split_hidden.grad, chunk_hidden.grad)
+
     def test_numerical_equivalence(self):
         """ChunkedCELoss must produce the same loss and gradients as the standard path."""
         torch.manual_seed(42)
@@ -444,7 +515,7 @@ class TestChunkedCELoss(unittest.TestCase):
         # Share the same lm_head weights
         model_chunked.output.load_state_dict(model_std.output.state_dict())
 
-        hidden_states = torch.randn(B, L, D, requires_grad=True)
+        hidden_states = torch.randn(B, L, D)
         labels = torch.randint(0, V, (B, L))
         labels[0, 1] = IGNORE_INDEX
         labels[1, 3] = IGNORE_INDEX
@@ -497,7 +568,7 @@ class TestChunkedCELoss(unittest.TestCase):
     def test_different_chunk_counts(self):
         """Loss should be the same regardless of num_chunks."""
         torch.manual_seed(42)
-        B, L, D, V = 2, 8, 32, 64
+        B, L, D, V = 2, 16, 32, 64
         labels = torch.randint(0, V, (B, L))
         global_valid_tokens = float((labels != IGNORE_INDEX).sum().item())
         hidden_states = torch.randn(B, L, D)
@@ -524,6 +595,74 @@ class TestChunkedCELoss(unittest.TestCase):
                 places=5,
                 msg=f"Loss with {2**i} chunks should match loss with 1 chunk",
             )
+
+    def test_symbolic_seq_len_traces_chunking(self):
+        from torch._dynamo.decorators import mark_unbacked
+        from torch.fx.experimental.proxy_tensor import make_fx
+
+        torch.manual_seed(42)
+        B, L, D, V, num_chunks = 2, 16, 8, 32, 4
+        _model, chunked_loss = self._make_model_and_loss(D, V, num_chunks)
+        hidden_states = torch.randn(B, L, D)
+        labels = torch.randint(0, V, (B, L))
+        for tensor in (hidden_states, labels):
+            mark_unbacked(
+                tensor,
+                1,
+                hint_override=L,
+                min=num_chunks,
+                max=L,
+                specialize_on=[lambda extent, hint=L: extent == hint],
+            )
+
+        traced = make_fx(
+            chunked_loss,
+            tracing_mode="symbolic",
+            _allow_non_fake_inputs=True,
+        )(hidden_states, labels)
+        expected_loss = self._torch_chunk_loss_reference(
+            chunked_loss.lm_head,
+            hidden_states,
+            labels,
+            num_chunks,
+        )
+        torch.testing.assert_close(traced(hidden_states, labels), expected_loss)
+
+        split_nodes = [
+            node
+            for node in traced.graph.nodes
+            if node.target is torch.ops.aten.split_with_sizes.default
+        ]
+        self.assertEqual(len(split_nodes), 2)
+
+    def test_rejects_non_divisible_sequence_length(self):
+        torch.manual_seed(42)
+        B, L, D, V, num_chunks = 2, 10, 8, 32, 4
+        _model, chunked_loss = self._make_model_and_loss(D, V, num_chunks)
+        hidden_states = torch.randn(B, L, D)
+        labels = torch.randint(0, V, (B, L))
+
+        with self.assertRaisesRegex(RuntimeError, "divisible by num_chunks=4"):
+            chunked_loss(hidden_states, labels)
+
+    def test_single_token_chunks_match_torch_chunk_reference(self):
+        torch.manual_seed(42)
+        B, L, D, V, num_chunks = 2, 4, 8, 32, 4
+        _model, chunked_loss = self._make_model_and_loss(D, V, num_chunks)
+        hidden_states = torch.randn(B, L, D)
+        labels = torch.randint(0, V, (B, L))
+        global_valid_tokens = float((labels != IGNORE_INDEX).sum().item())
+
+        expected_loss = self._torch_chunk_loss_reference(
+            chunked_loss.lm_head,
+            hidden_states,
+            labels,
+            num_chunks,
+            global_valid_tokens,
+        )
+        loss = chunked_loss(hidden_states, labels, global_valid_tokens)
+
+        torch.testing.assert_close(loss, expected_loss)
 
 
 class TestChunkedCELossSPMD(DTensorTestBase):

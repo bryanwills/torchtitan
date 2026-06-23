@@ -516,6 +516,37 @@ class ChunkedCELoss(BaseLoss):
         """Set the lm_head module. Must be called before the first __call__."""
         self.lm_head = lm_head
 
+    @staticmethod
+    def _split_equal_chunks(
+        t: torch.Tensor, num_chunks: int
+    ) -> tuple[torch.Tensor, ...]:
+        """Split local sequence into equal chunks.
+
+        This is equivalent to ``torch.chunk(t, num_chunks, dim=1)`` for the
+        supported ChunkedCELoss domain where the local sequence length is evenly
+        divisible by ``num_chunks``. Fixed split sizes keep FX tuple arity
+        static when the sequence length is an unbacked SymInt.
+        """
+        seq_len = t.shape[1]
+        torch._check(
+            seq_len % num_chunks == 0,
+            lambda: (
+                "ChunkedCELoss sequence length must be divisible by "
+                f"num_chunks={num_chunks}, got {seq_len}"
+            ),
+        )
+        chunk_len = seq_len // num_chunks
+        torch._check(
+            chunk_len > 0,
+            lambda: (
+                "ChunkedCELoss sequence chunks must have positive length, "
+                f"got seq_len={seq_len} and num_chunks={num_chunks}"
+            ),
+        )
+        return tuple(
+            c.contiguous() for c in torch.split(t, [chunk_len] * num_chunks, dim=1)
+        )
+
     def __call__(
         self,
         pred: torch.Tensor,
@@ -552,9 +583,10 @@ class ChunkedCELoss(BaseLoss):
         # local seq=0 and breaking GradAccumulator's slice writes.
         # ``local_map`` runs the chunking body on plain tensors; under the
         # non-DTensor (eager) path we call ``_chunk_local`` directly.
-        # ``.contiguous()`` breaks shared storage from ``torch.chunk``.
+        # Equal chunk sizes also match GradAccumulator's sequential slice
+        # writes, which use one chunk length for each write offset.
         def _chunk_local(t):
-            return tuple(c.contiguous() for c in torch.chunk(t, num_chunks, dim=1))
+            return ChunkedCELoss._split_equal_chunks(t, num_chunks)
 
         def _chunk(t):
             if not isinstance(t, DTensor):
