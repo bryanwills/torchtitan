@@ -35,7 +35,10 @@ class TestPermute(unittest.TestCase):
         total = tokens_per_expert_group.sum().item()
         dummy_input = torch.zeros(total, 1)
         _, _, permuted_indices, num_tokens_per_expert = dispatcher._permute(
-            dummy_input, tokens_per_expert_group
+            dummy_input,
+            tokens_per_expert_group,
+            num_ranks,
+            experts_per_rank,
         )
         return permuted_indices, num_tokens_per_expert
 

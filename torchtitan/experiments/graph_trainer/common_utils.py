@@ -65,7 +65,10 @@ def build_decoder_config_for_backend(
 
 
 _MODULE_FQN = "module_fqn"
+_EP_TOKEN_COUNT_EXCHANGE = "EP_token_count_exchange"
+_EP_TOKEN_COUNT_SYNC = "EP_token_count_sync"
 _EP_TOKEN_EXCHANGE = "EP_token_exchange"
+_EP_TOKEN_EXCHANGE_WAIT = "EP_token_exchange_wait"
 _NOT_IN_LAYERS = -1
 
 
@@ -134,6 +137,18 @@ def annotate_moe_ep_regions() -> None:
     AllToAllTokenDispatcher.combine = annotate_fn({"EP": "combine"})(
         AllToAllTokenDispatcher.combine
     )
+    AllToAllTokenDispatcher._token_count_exchange = annotate_fn(
+        {_EP_TOKEN_COUNT_EXCHANGE: "dispatch"}
+    )(AllToAllTokenDispatcher._token_count_exchange)
+    AllToAllTokenDispatcher._sync_token_count_exchange = annotate_fn(
+        {_EP_TOKEN_COUNT_SYNC: "dispatch"}
+    )(AllToAllTokenDispatcher._sync_token_count_exchange)
+    AllToAllTokenDispatcher._dispatch_token_exchange = annotate_fn(
+        {_EP_TOKEN_EXCHANGE: "dispatch"}
+    )(AllToAllTokenDispatcher._dispatch_token_exchange)
+    AllToAllTokenDispatcher._combine_token_exchange = annotate_fn(
+        {_EP_TOKEN_EXCHANGE: "combine"}
+    )(AllToAllTokenDispatcher._combine_token_exchange)
     MoE.forward = annotate_fn({"EP": "compute"})(MoE.forward)
     _MOE_EP_REGIONS_ANNOTATED = True
 
@@ -194,15 +209,35 @@ def end_with_pass(passes: list[Callable], names: list[str]) -> bool:
 
 def get_default_transformer_block_buckets(
     n_layers: int,
+    *,
+    moe_layer_ids: frozenset[int] = frozenset(),
+    split_moe_expert_buckets: bool = False,
 ) -> list[list[str] | str]:
     """Get default transformer block buckets for manual bucketing passes.
 
     Assumes the standard Decoder layout: tok_embeddings, layers.0..N-1,
     norm, and output (e.g., Llama3, DeepSeekV3, Qwen3).
     """
+    layer_buckets: list[list[str] | str] = []
+    for layer_id in range(n_layers):
+        if layer_id in moe_layer_ids and split_moe_expert_buckets:
+            layer_buckets.extend(
+                [
+                    [
+                        f"layers.{layer_id}.attention_norm",
+                        f"layers.{layer_id}.attention",
+                        f"layers.{layer_id}.ffn_norm",
+                        f"layers.{layer_id}.moe.router",
+                        f"layers.{layer_id}.moe.shared_experts",
+                    ],
+                    f"layers.{layer_id}.moe.experts",
+                ]
+            )
+        else:
+            layer_buckets.append(f"layers.{layer_id}")
     return [
         "tok_embeddings",
-        *[f"layers.{i}" for i in range(n_layers)],
+        *layer_buckets,
         ["norm", "lm_head"],
     ]
 
