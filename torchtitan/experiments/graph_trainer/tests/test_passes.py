@@ -27,10 +27,17 @@ from torchtitan.experiments.graph_trainer.common_utils import (
     _MODULE_FQN,
     annotate_module_fqns,
 )
+from torchtitan.experiments.graph_trainer.configs import (
+    EpOverlapConfig,
+    GraphTrainerCompileConfig,
+)
 from torchtitan.experiments.graph_trainer.cudagraph import (
     insert_kernel_annotations_pass,
     is_cudagraphable,
     is_full_cudagraphable,
+)
+from torchtitan.experiments.graph_trainer.ep_eager_chunk import (
+    apply_ep_overlap_eager_chunking,
 )
 from torchtitan.experiments.graph_trainer.ep_process_group_pass import (
     isolate_ep_process_group_pass,
@@ -2370,6 +2377,121 @@ class TestIsFullCudagraphable(TestCase):
         gm = torch.fx.GraphModule(torch.nn.Module(), g)
         self.assertFalse(is_cudagraphable(s))
         self.assertFalse(is_full_cudagraphable(gm))
+
+
+class TestEagerChunking(TestCase):
+    def test_eager_chunking_is_idempotent(self):
+        class Block(torch.nn.Module):
+            def forward(self, x):
+                return x.sin()
+
+        class Model(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layers = torch.nn.ModuleList([Block()])
+
+            def forward(self, x):
+                return self.layers[0](x)
+
+        model = Model()
+        config = GraphTrainerCompileConfig(
+            enable=True,
+            ep_overlap=EpOverlapConfig(
+                enabled=True,
+                strategy="eager",
+                module_fqn="layers.*",
+            ),
+        )
+        apply_ep_overlap_eager_chunking(model, config)
+        wrapped_forward = model.layers[0].forward
+        apply_ep_overlap_eager_chunking(model, config)
+
+        self.assertIs(model.layers[0].forward, wrapped_forward)
+
+    def test_eager_chunking_rejects_unsupported_output_type(self):
+        class Block(torch.nn.Module):
+            def forward(self, x):
+                return {"x": x}
+
+        class Model(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layers = torch.nn.ModuleList([Block()])
+
+            def forward(self, x):
+                return self.layers[0](x)
+
+        model = Model()
+        apply_ep_overlap_eager_chunking(
+            model,
+            GraphTrainerCompileConfig(
+                enable=True,
+                ep_overlap=EpOverlapConfig(
+                    enabled=True,
+                    strategy="eager",
+                    module_fqn="layers.*",
+                ),
+            ),
+        )
+
+        with self.assertRaisesRegex(TypeError, "layers.0.*dict"):
+            model(torch.randn(4, 3))
+
+    def test_eager_chunking_splits_block_mask_batch_metadata(self):
+        from torch.nn.attention.flex_attention import create_block_mask
+
+        seen_masks = []
+
+        def mask_mod(b, h, q_idx, kv_idx):
+            return (b == 2) & (q_idx >= kv_idx)
+
+        class Block(torch.nn.Module):
+            def forward(self, x, attention_masks, positions):
+                seen_masks.append(attention_masks)
+                return x
+
+        class Model(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.layers = torch.nn.ModuleList([Block()])
+
+            def forward(self, x, attention_masks, positions):
+                return self.layers[0](x, attention_masks, positions)
+
+        model = Model()
+        apply_ep_overlap_eager_chunking(
+            model,
+            GraphTrainerCompileConfig(
+                enable=True,
+                ep_overlap=EpOverlapConfig(
+                    enabled=True,
+                    strategy="eager",
+                    chunk_dim="batch",
+                    module_fqn="layers.*",
+                ),
+            ),
+        )
+        block_mask = create_block_mask(
+            mask_mod,
+            B=4,
+            H=None,
+            Q_LEN=128,
+            KV_LEN=128,
+            device="cpu",
+        )
+        x = torch.randn(4, 128, 8)
+        positions = torch.arange(128).repeat(4, 1)
+
+        self.assertEqual(model(x, block_mask, positions).shape, x.shape)
+        self.assertEqual(len(seen_masks), 2)
+        self.assertEqual([mask.kv_num_blocks.size(0) for mask in seen_masks], [2, 2])
+
+        b = torch.tensor(0)
+        h = torch.tensor(0)
+        q_idx = torch.tensor(1)
+        kv_idx = torch.tensor(0)
+        self.assertFalse(seen_masks[0].mask_mod(b, h, q_idx, kv_idx).item())
+        self.assertTrue(seen_masks[1].mask_mod(b, h, q_idx, kv_idx).item())
 
 
 if __name__ == "__main__":
